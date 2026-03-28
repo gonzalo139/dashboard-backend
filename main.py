@@ -19,8 +19,8 @@ app.add_middleware(
 
 security = HTTPBasic()
 DB_PATH = os.environ.get("DB_PATH", "operadores.db")
-ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin1234")
+ADMIN_USER = os.environ.get("ADMIN_USER", "dashboard_greatest")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "y9OMlS:imGkE}5-}yS46")
 
 # ─── DB SETUP ─────────────────────────────────────────────────────────────────
 
