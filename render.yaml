@@ -1,18 +1,5 @@
-services:
-  - type: web
-    name: operador-status-api
-    env: python
-    pythonVersion: "3.11.9"
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-    envVars:
-      - key: ADMIN_USER
-        value: admin
-      - key: ADMIN_PASS
-        generateValue: true
-      - key: DB_PATH
-        value: /var/data/operadores.db
-    disk:
-      name: db-disk
-      mountPath: /var/data
-      sizeGB: 1
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+pydantic==2.12.5
+python-multipart==0.0.20
+psycopg2-binary==2.9.10
