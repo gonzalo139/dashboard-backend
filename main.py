@@ -363,4 +363,21 @@ async def ws_dashboard(ws: WebSocket):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "time": utcnow().isoformat()}
+    db_status = "unknown"
+    db_error = None
+    has_url = bool(DATABASE_URL)
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                db_status = "ok"
+    except Exception as e:
+        db_status = "error"
+        db_error = str(e)
+    return {
+        "status": "ok" if db_status == "ok" else "degraded",
+        "db": db_status,
+        "db_error": db_error,
+        "has_database_url": has_url,
+        "time": utcnow().isoformat(),
+    }
