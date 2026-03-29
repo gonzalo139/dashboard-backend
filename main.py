@@ -18,7 +18,11 @@ app.add_middleware(
 )
 
 security = HTTPBasic()
-DB_PATH = os.environ.get("DB_PATH", "operadores.db")
+
+# Fallback to local dir if /var/data doesn't exist (avoids crash on free tier)
+_default_db = "/var/data/operadores.db" if os.path.isdir("/var/data") else "/tmp/operadores.db"
+DB_PATH = os.environ.get("DB_PATH", _default_db)
+
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin1234")
 
@@ -30,6 +34,11 @@ def get_db():
     return conn
 
 def init_db():
+    # Ensure parent directory exists
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
     conn = get_db()
     c = conn.cursor()
     c.executescript("""
@@ -174,19 +183,16 @@ def operator_info(token: str):
         if last_log:
             last_log = dict(last_log)
             current_status = last_log["status"]
-            if last_log["ended_at"] is None:
+            if last_log["ended_at"] is None and current_status == "available":
                 started = datetime.fromisoformat(last_log["started_at"])
                 elapsed_available += int((datetime.utcnow() - started).total_seconds())
 
-        # Sum all available time already consumed
         rows = conn.execute(
             "SELECT SUM(duration_seconds) as total FROM status_log WHERE session_id=? AND status='available' AND ended_at IS NOT NULL",
             (session["id"],)
         ).fetchone()
         if rows["total"]:
-            elapsed_available += rows["total"] if current_status == "available" else 0
-            if current_status != "available":
-                elapsed_available = rows["total"]
+            elapsed_available += rows["total"]
 
     conn.close()
     return {
@@ -215,7 +221,6 @@ async def start_session(token: str, data: StartSession):
         (op["id"], today, data.available_minutes, now)
     )
     session_id = cur.lastrowid
-    # Start as available
     conn.execute(
         "INSERT INTO status_log (operator_id, session_id, status, started_at) VALUES (?,?,?,?)",
         (op["id"], session_id, "available", now)
@@ -245,7 +250,6 @@ async def update_status(token: str, data: UpdateStatus):
     now = datetime.utcnow().isoformat()
     session = dict(session)
 
-    # Close last open log
     last = conn.execute(
         "SELECT * FROM status_log WHERE session_id=? AND ended_at IS NULL ORDER BY id DESC LIMIT 1",
         (session["id"],)
@@ -259,32 +263,26 @@ async def update_status(token: str, data: UpdateStatus):
             (now, duration, last["id"])
         )
 
-    # Insert new
     conn.execute(
         "INSERT INTO status_log (operator_id, session_id, status, started_at) VALUES (?,?,?,?)",
         (op["id"], session["id"], data.status, now)
     )
     conn.commit()
 
-    # Get available seconds consumed
     rows = conn.execute(
         "SELECT SUM(duration_seconds) as total FROM status_log WHERE session_id=? AND status='available' AND ended_at IS NOT NULL",
         (session["id"],)
     ).fetchone()
     elapsed = rows["total"] or 0
-    if data.status == "available":
-        elapsed_available = elapsed
-    else:
-        elapsed_available = elapsed
-
     conn.close()
+
     await manager.broadcast({
         "event": "status_change",
         "operator_id": op["id"],
         "name": op["name"],
         "status": data.status,
         "available_minutes": session["available_minutes"],
-        "elapsed_available_seconds": elapsed_available,
+        "elapsed_available_seconds": elapsed,
     })
     return {"ok": True}
 
@@ -390,4 +388,4 @@ async def ws_dashboard(ws: WebSocket):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+    return {"status": "ok", "db": DB_PATH, "time": datetime.utcnow().isoformat()}
