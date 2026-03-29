@@ -1,5 +1,6 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import List
@@ -11,13 +12,24 @@ import psycopg2.extras
 
 app = FastAPI(title="Operador Status API")
 
+# CORS must be first and catch-all
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+
+# Global exception handler so 500s also get CORS headers
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
 
 security = HTTPBasic()
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -27,11 +39,38 @@ ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin1234")
 # ─── DB ───────────────────────────────────────────────────────────────────────
 
 def get_db():
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL environment variable is not set")
+    # Supabase sometimes gives 'postgres://' instead of 'postgresql://'
+    url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    conn = psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
     return conn
 
 def utcnow():
     return datetime.now(timezone.utc)
+
+# ─── HEALTH ───────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    db_status = "unknown"
+    db_error = None
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                db_status = "ok"
+    except Exception as e:
+        db_status = "error"
+        db_error = str(e)
+    return {
+        "status": "ok" if db_status == "ok" else "degraded",
+        "db": db_status,
+        "db_error": db_error,
+        "has_database_url": bool(DATABASE_URL),
+        "database_url_prefix": DATABASE_URL[:30] + "..." if DATABASE_URL else "NOT SET",
+        "time": utcnow().isoformat(),
+    }
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
 
@@ -39,9 +78,11 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
     ok_user = secrets.compare_digest(credentials.username, ADMIN_USER)
     ok_pass = secrets.compare_digest(credentials.password, ADMIN_PASS)
     if not (ok_user and ok_pass):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                            detail="Invalid credentials",
-                            headers={"WWW-Authenticate": "Basic"})
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic", "Access-Control-Allow-Origin": "*"},
+        )
     return credentials.username
 
 def get_operator_by_token(token: str):
@@ -120,7 +161,7 @@ def delete_operator(op_id: str):
         conn.commit()
     return {"ok": True}
 
-# ─── OPERATOR ────────────────────────────────────────────────────────────────
+# ─── OPERATOR ─────────────────────────────────────────────────────────────────
 
 @app.get("/op/{token}/info")
 def operator_info(token: str):
@@ -134,7 +175,6 @@ def operator_info(token: str):
             )
             session = cur.fetchone()
             session = dict(session) if session else None
-
             elapsed_available = 0
             current_status = None
 
@@ -157,8 +197,7 @@ def operator_info(token: str):
                     "SELECT COALESCE(SUM(duration_seconds),0) as total FROM status_log WHERE session_id=%s AND status='available' AND ended_at IS NOT NULL",
                     (session["id"],)
                 )
-                row = cur.fetchone()
-                elapsed_available += row["total"]
+                elapsed_available += cur.fetchone()["total"]
 
     return {
         "operator": op,
@@ -172,7 +211,6 @@ async def start_session(token: str, data: StartSession):
     op = get_operator_by_token(token)
     today = date.today().isoformat()
     now = utcnow()
-
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -182,7 +220,6 @@ async def start_session(token: str, data: StartSession):
             existing = cur.fetchone()
             if existing:
                 return {"session_id": existing["id"], "already_exists": True}
-
             cur.execute(
                 "INSERT INTO sessions (operator_id, date, available_minutes, started_at) VALUES (%s,%s,%s,%s) RETURNING id",
                 (op["id"], today, data.available_minutes, now)
@@ -193,7 +230,6 @@ async def start_session(token: str, data: StartSession):
                 (op["id"], session_id, "available", now)
             )
         conn.commit()
-
     await manager.broadcast({"event": "status_change", "operator_id": op["id"],
                              "name": op["name"], "status": "available",
                              "available_minutes": data.available_minutes})
@@ -206,7 +242,6 @@ async def update_status(token: str, data: UpdateStatus):
     op = get_operator_by_token(token)
     today = date.today().isoformat()
     now = utcnow()
-
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -217,8 +252,6 @@ async def update_status(token: str, data: UpdateStatus):
             if not session:
                 raise HTTPException(status_code=400, detail="No active session for today")
             session = dict(session)
-
-            # Close last open log
             cur.execute(
                 "SELECT * FROM status_log WHERE session_id=%s AND ended_at IS NULL ORDER BY id DESC LIMIT 1",
                 (session["id"],)
@@ -234,19 +267,16 @@ async def update_status(token: str, data: UpdateStatus):
                     "UPDATE status_log SET ended_at=%s, duration_seconds=%s WHERE id=%s",
                     (now, duration, last["id"])
                 )
-
             cur.execute(
                 "INSERT INTO status_log (operator_id, session_id, status, started_at) VALUES (%s,%s,%s,%s)",
                 (op["id"], session["id"], data.status, now)
             )
-
             cur.execute(
                 "SELECT COALESCE(SUM(duration_seconds),0) as total FROM status_log WHERE session_id=%s AND status='available' AND ended_at IS NOT NULL",
                 (session["id"],)
             )
             elapsed = cur.fetchone()["total"]
         conn.commit()
-
     await manager.broadcast({
         "event": "status_change",
         "operator_id": op["id"],
@@ -293,26 +323,22 @@ def dashboard_current():
                                    "elapsed_available_seconds": 0, "session": None})
                     continue
                 session = dict(session)
-
                 cur.execute(
                     "SELECT * FROM status_log WHERE session_id=%s ORDER BY id DESC LIMIT 1",
                     (session["id"],)
                 )
                 last_log = cur.fetchone()
                 current_status = dict(last_log)["status"] if last_log else "offline"
-
                 cur.execute(
                     "SELECT COALESCE(SUM(duration_seconds),0) as total FROM status_log WHERE session_id=%s AND status='available' AND ended_at IS NOT NULL",
                     (session["id"],)
                 )
                 elapsed = cur.fetchone()["total"]
-
                 if current_status == "available" and last_log:
                     started = dict(last_log)["started_at"]
                     if started.tzinfo is None:
                         started = started.replace(tzinfo=timezone.utc)
                     elapsed += int((utcnow() - started).total_seconds())
-
                 result.append({
                     **op,
                     "status": current_status,
@@ -360,24 +386,3 @@ async def ws_dashboard(ws: WebSocket):
             await ws.send_json({"event": "ping"})
     except WebSocketDisconnect:
         manager.disconnect_dashboard(ws)
-
-@app.get("/health")
-def health():
-    db_status = "unknown"
-    db_error = None
-    has_url = bool(DATABASE_URL)
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                db_status = "ok"
-    except Exception as e:
-        db_status = "error"
-        db_error = str(e)
-    return {
-        "status": "ok" if db_status == "ok" else "degraded",
-        "db": db_status,
-        "db_error": db_error,
-        "has_database_url": has_url,
-        "time": utcnow().isoformat(),
-    }
