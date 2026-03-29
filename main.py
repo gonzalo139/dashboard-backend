@@ -2,10 +2,12 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depe
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
-from typing import Optional, List
-import sqlite3, uuid, json, asyncio, secrets, hashlib
-from datetime import datetime, date, timedelta
+from typing import List
+import uuid, asyncio, secrets
+from datetime import datetime, date, timedelta, timezone
 import os
+import psycopg2
+import psycopg2.extras
 
 app = FastAPI(title="Operador Status API")
 
@@ -18,62 +20,49 @@ app.add_middleware(
 )
 
 security = HTTPBasic()
-
-# Fallback to local dir if /var/data doesn't exist (avoids crash on free tier)
-_default_db = "/var/data/operadores.db" if os.path.isdir("/var/data") else "/tmp/operadores.db"
-DB_PATH = os.environ.get("DB_PATH", _default_db)
-
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin1234")
 
-# ─── DB SETUP ─────────────────────────────────────────────────────────────────
+# ─── DB ───────────────────────────────────────────────────────────────────────
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     return conn
 
-def init_db():
-    # Ensure parent directory exists
-    db_dir = os.path.dirname(DB_PATH)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
+def utcnow():
+    return datetime.now(timezone.utc)
 
-    conn = get_db()
-    c = conn.cursor()
-    c.executescript("""
-        CREATE TABLE IF NOT EXISTS operators (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            token TEXT UNIQUE NOT NULL,
-            created_at TEXT DEFAULT (datetime('now'))
-        );
+# ─── AUTH ─────────────────────────────────────────────────────────────────────
 
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            operator_id TEXT NOT NULL,
-            date TEXT NOT NULL,
-            available_minutes INTEGER DEFAULT 240,
-            started_at TEXT,
-            FOREIGN KEY(operator_id) REFERENCES operators(id)
-        );
+def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
+    ok_user = secrets.compare_digest(credentials.username, ADMIN_USER)
+    ok_pass = secrets.compare_digest(credentials.password, ADMIN_PASS)
+    if not (ok_user and ok_pass):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Invalid credentials",
+                            headers={"WWW-Authenticate": "Basic"})
+    return credentials.username
 
-        CREATE TABLE IF NOT EXISTS status_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            operator_id TEXT NOT NULL,
-            session_id INTEGER,
-            status TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            ended_at TEXT,
-            duration_seconds INTEGER,
-            FOREIGN KEY(operator_id) REFERENCES operators(id),
-            FOREIGN KEY(session_id) REFERENCES sessions(id)
-        );
-    """)
-    conn.commit()
-    conn.close()
+def get_operator_by_token(token: str):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM operators WHERE token=%s", (token,))
+            op = cur.fetchone()
+    if not op:
+        raise HTTPException(status_code=404, detail="Operator not found")
+    return dict(op)
 
-init_db()
+# ─── MODELS ───────────────────────────────────────────────────────────────────
+
+class CreateOperator(BaseModel):
+    name: str
+
+class StartSession(BaseModel):
+    available_minutes: int = 240
+
+class UpdateStatus(BaseModel):
+    status: str
 
 # ─── WEBSOCKET MANAGER ────────────────────────────────────────────────────────
 
@@ -101,100 +90,76 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# ─── AUTH ─────────────────────────────────────────────────────────────────────
-
-def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    ok_user = secrets.compare_digest(credentials.username, ADMIN_USER)
-    ok_pass = secrets.compare_digest(credentials.password, ADMIN_PASS)
-    if not (ok_user and ok_pass):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                            detail="Invalid credentials",
-                            headers={"WWW-Authenticate": "Basic"})
-    return credentials.username
-
-def get_operator_by_token(token: str):
-    conn = get_db()
-    op = conn.execute("SELECT * FROM operators WHERE token=?", (token,)).fetchone()
-    conn.close()
-    if not op:
-        raise HTTPException(status_code=404, detail="Operator not found")
-    return dict(op)
-
-# ─── MODELS ───────────────────────────────────────────────────────────────────
-
-class CreateOperator(BaseModel):
-    name: str
-
-class StartSession(BaseModel):
-    available_minutes: int = 240
-
-class UpdateStatus(BaseModel):
-    status: str  # available | busy | offline
-
-# ─── ADMIN ENDPOINTS ──────────────────────────────────────────────────────────
+# ─── ADMIN ────────────────────────────────────────────────────────────────────
 
 @app.get("/admin/operators", dependencies=[Depends(verify_admin)])
 def list_operators():
-    conn = get_db()
-    ops = conn.execute("SELECT * FROM operators ORDER BY name").fetchall()
-    conn.close()
-    return [dict(o) for o in ops]
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM operators ORDER BY name")
+            return [dict(r) for r in cur.fetchall()]
 
 @app.post("/admin/operators", dependencies=[Depends(verify_admin)])
 def create_operator(data: CreateOperator):
-    conn = get_db()
     op_id = str(uuid.uuid4())
     token = str(uuid.uuid4()).replace("-", "")
-    conn.execute("INSERT INTO operators (id, name, token) VALUES (?,?,?)",
-                 (op_id, data.name, token))
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO operators (id, name, token) VALUES (%s,%s,%s)",
+                (op_id, data.name, token)
+            )
+        conn.commit()
     return {"id": op_id, "name": data.name, "token": token}
 
 @app.delete("/admin/operators/{op_id}", dependencies=[Depends(verify_admin)])
 def delete_operator(op_id: str):
-    conn = get_db()
-    conn.execute("DELETE FROM operators WHERE id=?", (op_id,))
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM operators WHERE id=%s", (op_id,))
+        conn.commit()
     return {"ok": True}
 
-# ─── OPERATOR ENDPOINTS ───────────────────────────────────────────────────────
+# ─── OPERATOR ────────────────────────────────────────────────────────────────
 
 @app.get("/op/{token}/info")
 def operator_info(token: str):
     op = get_operator_by_token(token)
-    conn = get_db()
     today = date.today().isoformat()
-    session = conn.execute(
-        "SELECT * FROM sessions WHERE operator_id=? AND date=? ORDER BY id DESC LIMIT 1",
-        (op["id"], today)
-    ).fetchone()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM sessions WHERE operator_id=%s AND date=%s ORDER BY id DESC LIMIT 1",
+                (op["id"], today)
+            )
+            session = cur.fetchone()
+            session = dict(session) if session else None
 
-    current_status = None
-    elapsed_available = 0
+            elapsed_available = 0
+            current_status = None
 
-    if session:
-        session = dict(session)
-        last_log = conn.execute(
-            "SELECT * FROM status_log WHERE session_id=? ORDER BY id DESC LIMIT 1",
-            (session["id"],)
-        ).fetchone()
-        if last_log:
-            last_log = dict(last_log)
-            current_status = last_log["status"]
-            if last_log["ended_at"] is None and current_status == "available":
-                started = datetime.fromisoformat(last_log["started_at"])
-                elapsed_available += int((datetime.utcnow() - started).total_seconds())
+            if session:
+                cur.execute(
+                    "SELECT * FROM status_log WHERE session_id=%s ORDER BY id DESC LIMIT 1",
+                    (session["id"],)
+                )
+                last_log = cur.fetchone()
+                if last_log:
+                    last_log = dict(last_log)
+                    current_status = last_log["status"]
+                    if last_log["ended_at"] is None and current_status == "available":
+                        started = last_log["started_at"]
+                        if started.tzinfo is None:
+                            started = started.replace(tzinfo=timezone.utc)
+                        elapsed_available += int((utcnow() - started).total_seconds())
 
-        rows = conn.execute(
-            "SELECT SUM(duration_seconds) as total FROM status_log WHERE session_id=? AND status='available' AND ended_at IS NOT NULL",
-            (session["id"],)
-        ).fetchone()
-        if rows["total"]:
-            elapsed_available += rows["total"]
+                cur.execute(
+                    "SELECT COALESCE(SUM(duration_seconds),0) as total FROM status_log WHERE session_id=%s AND status='available' AND ended_at IS NOT NULL",
+                    (session["id"],)
+                )
+                row = cur.fetchone()
+                elapsed_available += row["total"]
 
-    conn.close()
     return {
         "operator": op,
         "session": session,
@@ -205,28 +170,30 @@ def operator_info(token: str):
 @app.post("/op/{token}/session/start")
 async def start_session(token: str, data: StartSession):
     op = get_operator_by_token(token)
-    conn = get_db()
     today = date.today().isoformat()
-    existing = conn.execute(
-        "SELECT * FROM sessions WHERE operator_id=? AND date=?",
-        (op["id"], today)
-    ).fetchone()
-    if existing:
-        conn.close()
-        return {"session_id": existing["id"], "already_exists": True}
+    now = utcnow()
 
-    now = datetime.utcnow().isoformat()
-    cur = conn.execute(
-        "INSERT INTO sessions (operator_id, date, available_minutes, started_at) VALUES (?,?,?,?)",
-        (op["id"], today, data.available_minutes, now)
-    )
-    session_id = cur.lastrowid
-    conn.execute(
-        "INSERT INTO status_log (operator_id, session_id, status, started_at) VALUES (?,?,?,?)",
-        (op["id"], session_id, "available", now)
-    )
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM sessions WHERE operator_id=%s AND date=%s",
+                (op["id"], today)
+            )
+            existing = cur.fetchone()
+            if existing:
+                return {"session_id": existing["id"], "already_exists": True}
+
+            cur.execute(
+                "INSERT INTO sessions (operator_id, date, available_minutes, started_at) VALUES (%s,%s,%s,%s) RETURNING id",
+                (op["id"], today, data.available_minutes, now)
+            )
+            session_id = cur.fetchone()["id"]
+            cur.execute(
+                "INSERT INTO status_log (operator_id, session_id, status, started_at) VALUES (%s,%s,%s,%s)",
+                (op["id"], session_id, "available", now)
+            )
+        conn.commit()
+
     await manager.broadcast({"event": "status_change", "operator_id": op["id"],
                              "name": op["name"], "status": "available",
                              "available_minutes": data.available_minutes})
@@ -237,44 +204,48 @@ async def update_status(token: str, data: UpdateStatus):
     if data.status not in ("available", "busy", "offline"):
         raise HTTPException(status_code=400, detail="Invalid status")
     op = get_operator_by_token(token)
-    conn = get_db()
     today = date.today().isoformat()
-    session = conn.execute(
-        "SELECT * FROM sessions WHERE operator_id=? AND date=? ORDER BY id DESC LIMIT 1",
-        (op["id"], today)
-    ).fetchone()
-    if not session:
-        conn.close()
-        raise HTTPException(status_code=400, detail="No active session for today")
+    now = utcnow()
 
-    now = datetime.utcnow().isoformat()
-    session = dict(session)
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM sessions WHERE operator_id=%s AND date=%s ORDER BY id DESC LIMIT 1",
+                (op["id"], today)
+            )
+            session = cur.fetchone()
+            if not session:
+                raise HTTPException(status_code=400, detail="No active session for today")
+            session = dict(session)
 
-    last = conn.execute(
-        "SELECT * FROM status_log WHERE session_id=? AND ended_at IS NULL ORDER BY id DESC LIMIT 1",
-        (session["id"],)
-    ).fetchone()
-    if last:
-        last = dict(last)
-        started = datetime.fromisoformat(last["started_at"])
-        duration = int((datetime.utcnow() - started).total_seconds())
-        conn.execute(
-            "UPDATE status_log SET ended_at=?, duration_seconds=? WHERE id=?",
-            (now, duration, last["id"])
-        )
+            # Close last open log
+            cur.execute(
+                "SELECT * FROM status_log WHERE session_id=%s AND ended_at IS NULL ORDER BY id DESC LIMIT 1",
+                (session["id"],)
+            )
+            last = cur.fetchone()
+            if last:
+                last = dict(last)
+                started = last["started_at"]
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+                duration = int((now - started).total_seconds())
+                cur.execute(
+                    "UPDATE status_log SET ended_at=%s, duration_seconds=%s WHERE id=%s",
+                    (now, duration, last["id"])
+                )
 
-    conn.execute(
-        "INSERT INTO status_log (operator_id, session_id, status, started_at) VALUES (?,?,?,?)",
-        (op["id"], session["id"], data.status, now)
-    )
-    conn.commit()
+            cur.execute(
+                "INSERT INTO status_log (operator_id, session_id, status, started_at) VALUES (%s,%s,%s,%s)",
+                (op["id"], session["id"], data.status, now)
+            )
 
-    rows = conn.execute(
-        "SELECT SUM(duration_seconds) as total FROM status_log WHERE session_id=? AND status='available' AND ended_at IS NOT NULL",
-        (session["id"],)
-    ).fetchone()
-    elapsed = rows["total"] or 0
-    conn.close()
+            cur.execute(
+                "SELECT COALESCE(SUM(duration_seconds),0) as total FROM status_log WHERE session_id=%s AND status='available' AND ended_at IS NOT NULL",
+                (session["id"],)
+            )
+            elapsed = cur.fetchone()["total"]
+        conn.commit()
 
     await manager.broadcast({
         "event": "status_change",
@@ -289,89 +260,93 @@ async def update_status(token: str, data: UpdateStatus):
 @app.post("/op/{token}/available-time")
 async def update_available_time(token: str, minutes: int):
     op = get_operator_by_token(token)
-    conn = get_db()
     today = date.today().isoformat()
-    conn.execute(
-        "UPDATE sessions SET available_minutes=? WHERE operator_id=? AND date=?",
-        (minutes, op["id"], today)
-    )
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE sessions SET available_minutes=%s WHERE operator_id=%s AND date=%s",
+                (minutes, op["id"], today)
+            )
+        conn.commit()
     await manager.broadcast({"event": "time_update", "operator_id": op["id"],
                              "name": op["name"], "available_minutes": minutes})
     return {"ok": True}
 
-# ─── DASHBOARD ENDPOINTS ──────────────────────────────────────────────────────
+# ─── DASHBOARD ────────────────────────────────────────────────────────────────
 
 @app.get("/dashboard/current")
 def dashboard_current():
-    conn = get_db()
     today = date.today().isoformat()
-    operators = conn.execute("SELECT * FROM operators").fetchall()
-    result = []
-    for op in operators:
-        op = dict(op)
-        session = conn.execute(
-            "SELECT * FROM sessions WHERE operator_id=? AND date=? ORDER BY id DESC LIMIT 1",
-            (op["id"], today)
-        ).fetchone()
-        if not session:
-            result.append({**op, "status": "offline", "available_minutes": 0,
-                           "elapsed_available_seconds": 0, "session": None})
-            continue
-        session = dict(session)
-        last_log = conn.execute(
-            "SELECT * FROM status_log WHERE session_id=? ORDER BY id DESC LIMIT 1",
-            (session["id"],)
-        ).fetchone()
-        current_status = dict(last_log)["status"] if last_log else "offline"
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM operators")
+            operators = [dict(r) for r in cur.fetchall()]
+            result = []
+            for op in operators:
+                cur.execute(
+                    "SELECT * FROM sessions WHERE operator_id=%s AND date=%s ORDER BY id DESC LIMIT 1",
+                    (op["id"], today)
+                )
+                session = cur.fetchone()
+                if not session:
+                    result.append({**op, "status": "offline", "available_minutes": 0,
+                                   "elapsed_available_seconds": 0, "session": None})
+                    continue
+                session = dict(session)
 
-        rows = conn.execute(
-            "SELECT SUM(duration_seconds) as total FROM status_log WHERE session_id=? AND status='available' AND ended_at IS NOT NULL",
-            (session["id"],)
-        ).fetchone()
-        elapsed = rows["total"] or 0
-        if current_status == "available" and last_log:
-            started = datetime.fromisoformat(dict(last_log)["started_at"])
-            elapsed += int((datetime.utcnow() - started).total_seconds())
+                cur.execute(
+                    "SELECT * FROM status_log WHERE session_id=%s ORDER BY id DESC LIMIT 1",
+                    (session["id"],)
+                )
+                last_log = cur.fetchone()
+                current_status = dict(last_log)["status"] if last_log else "offline"
 
-        result.append({
-            **op,
-            "status": current_status,
-            "available_minutes": session["available_minutes"],
-            "elapsed_available_seconds": elapsed,
-            "session": session,
-        })
-    conn.close()
+                cur.execute(
+                    "SELECT COALESCE(SUM(duration_seconds),0) as total FROM status_log WHERE session_id=%s AND status='available' AND ended_at IS NOT NULL",
+                    (session["id"],)
+                )
+                elapsed = cur.fetchone()["total"]
+
+                if current_status == "available" and last_log:
+                    started = dict(last_log)["started_at"]
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=timezone.utc)
+                    elapsed += int((utcnow() - started).total_seconds())
+
+                result.append({
+                    **op,
+                    "status": current_status,
+                    "available_minutes": session["available_minutes"],
+                    "elapsed_available_seconds": elapsed,
+                    "session": session,
+                })
     return result
 
 @app.get("/dashboard/history")
 def dashboard_history(days: int = 30):
-    conn = get_db()
     since = (date.today() - timedelta(days=days)).isoformat()
-    ops = conn.execute("SELECT * FROM operators").fetchall()
-    result = []
-    for op in ops:
-        op = dict(op)
-        sessions = conn.execute(
-            "SELECT s.*, COUNT(sl.id) as state_changes FROM sessions s "
-            "LEFT JOIN status_log sl ON sl.session_id = s.id "
-            "WHERE s.operator_id=? AND s.date >= ? "
-            "GROUP BY s.id ORDER BY s.date DESC",
-            (op["id"], since)
-        ).fetchall()
-        daily = []
-        for s in sessions:
-            s = dict(s)
-            stats = conn.execute(
-                "SELECT status, SUM(duration_seconds) as total FROM status_log "
-                "WHERE session_id=? AND ended_at IS NOT NULL GROUP BY status",
-                (s["id"],)
-            ).fetchall()
-            s["stats"] = {r["status"]: r["total"] or 0 for r in stats}
-            daily.append(s)
-        result.append({**op, "sessions": daily})
-    conn.close()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM operators")
+            operators = [dict(r) for r in cur.fetchall()]
+            result = []
+            for op in operators:
+                cur.execute(
+                    """SELECT s.*, COUNT(sl.id) as state_changes
+                       FROM sessions s
+                       LEFT JOIN status_log sl ON sl.session_id = s.id
+                       WHERE s.operator_id=%s AND s.date >= %s
+                       GROUP BY s.id ORDER BY s.date DESC""",
+                    (op["id"], since)
+                )
+                sessions = [dict(r) for r in cur.fetchall()]
+                for s in sessions:
+                    cur.execute(
+                        "SELECT status, COALESCE(SUM(duration_seconds),0) as total FROM status_log WHERE session_id=%s AND ended_at IS NOT NULL GROUP BY status",
+                        (s["id"],)
+                    )
+                    s["stats"] = {r["status"]: r["total"] for r in cur.fetchall()}
+                result.append({**op, "sessions": sessions})
     return result
 
 # ─── WEBSOCKET ────────────────────────────────────────────────────────────────
@@ -388,4 +363,4 @@ async def ws_dashboard(ws: WebSocket):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "db": DB_PATH, "time": datetime.utcnow().isoformat()}
+    return {"status": "ok", "time": utcnow().isoformat()}
