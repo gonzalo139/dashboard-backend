@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 import uuid, asyncio, secrets
 from datetime import datetime, date, timedelta, timezone
 import os
@@ -12,7 +12,6 @@ import psycopg2.extras
 
 app = FastAPI(title="Operador Status API")
 
-# CORS must be first and catch-all
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,7 +21,6 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-# Global exception handler so 500s also get CORS headers
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
@@ -40,37 +38,28 @@ ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin1234")
 
 def get_db():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL environment variable is not set")
-    # Supabase sometimes gives 'postgres://' instead of 'postgresql://'
+        raise RuntimeError("DATABASE_URL not set")
     url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    conn = psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
-    return conn
+    return psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
 
 def utcnow():
     return datetime.now(timezone.utc)
 
-# ─── HEALTH ───────────────────────────────────────────────────────────────────
-
-@app.get("/health")
-def health():
-    db_status = "unknown"
-    db_error = None
+def init_supervisor_table():
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                db_status = "ok"
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS supervisors (
+                        id TEXT PRIMARY KEY,
+                        username TEXT UNIQUE NOT NULL,
+                        password_hash TEXT NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+            conn.commit()
     except Exception as e:
-        db_status = "error"
-        db_error = str(e)
-    return {
-        "status": "ok" if db_status == "ok" else "degraded",
-        "db": db_status,
-        "db_error": db_error,
-        "has_database_url": bool(DATABASE_URL),
-        "database_url_prefix": DATABASE_URL[:30] + "..." if DATABASE_URL else "NOT SET",
-        "time": utcnow().isoformat(),
-    }
+        print(f"Could not init supervisors table: {e}")
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
 
@@ -84,6 +73,30 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
             headers={"WWW-Authenticate": "Basic", "Access-Control-Allow-Origin": "*"},
         )
     return credentials.username
+
+def verify_supervisor(credentials: HTTPBasicCredentials = Depends(security)):
+    # First check master admin
+    if (secrets.compare_digest(credentials.username, ADMIN_USER) and
+            secrets.compare_digest(credentials.password, ADMIN_PASS)):
+        return credentials.username
+    # Then check supervisors table
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM supervisors WHERE username=%s", (credentials.username,))
+                sup = cur.fetchone()
+        if sup:
+            import hashlib
+            ph = hashlib.sha256(credentials.password.encode()).hexdigest()
+            if secrets.compare_digest(ph, sup["password_hash"]):
+                return credentials.username
+    except:
+        pass
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid credentials",
+        headers={"WWW-Authenticate": "Basic", "Access-Control-Allow-Origin": "*"},
+    )
 
 def get_operator_by_token(token: str):
     with get_db() as conn:
@@ -104,6 +117,10 @@ class StartSession(BaseModel):
 
 class UpdateStatus(BaseModel):
     status: str
+
+class CreateSupervisor(BaseModel):
+    username: str
+    password: str
 
 # ─── WEBSOCKET MANAGER ────────────────────────────────────────────────────────
 
@@ -131,7 +148,29 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# ─── ADMIN ────────────────────────────────────────────────────────────────────
+# ─── HEALTH ───────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    db_status = "unknown"
+    db_error = None
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                db_status = "ok"
+    except Exception as e:
+        db_status = "error"
+        db_error = str(e)
+    return {
+        "status": "ok" if db_status == "ok" else "degraded",
+        "db": db_status,
+        "db_error": db_error,
+        "has_database_url": bool(DATABASE_URL),
+        "time": utcnow().isoformat(),
+    }
+
+# ─── ADMIN: OPERATORS ─────────────────────────────────────────────────────────
 
 @app.get("/admin/operators", dependencies=[Depends(verify_admin)])
 def list_operators():
@@ -146,10 +185,8 @@ def create_operator(data: CreateOperator):
     token = str(uuid.uuid4()).replace("-", "")
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO operators (id, name, token) VALUES (%s,%s,%s)",
-                (op_id, data.name, token)
-            )
+            cur.execute("INSERT INTO operators (id, name, token) VALUES (%s,%s,%s)",
+                        (op_id, data.name, token))
         conn.commit()
     return {"id": op_id, "name": data.name, "token": token}
 
@@ -161,6 +198,46 @@ def delete_operator(op_id: str):
         conn.commit()
     return {"ok": True}
 
+# ─── ADMIN: SUPERVISORS ───────────────────────────────────────────────────────
+
+@app.get("/admin/supervisors", dependencies=[Depends(verify_admin)])
+def list_supervisors():
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, username, created_at FROM supervisors ORDER BY username")
+                return [dict(r) for r in cur.fetchall()]
+    except:
+        return []
+
+@app.post("/admin/supervisors", dependencies=[Depends(verify_admin)])
+def create_supervisor(data: CreateSupervisor):
+    import hashlib
+    sup_id = str(uuid.uuid4())
+    ph = hashlib.sha256(data.password.encode()).hexdigest()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO supervisors (id, username, password_hash) VALUES (%s,%s,%s)",
+                (sup_id, data.username, ph)
+            )
+        conn.commit()
+    return {"id": sup_id, "username": data.username}
+
+@app.delete("/admin/supervisors/{sup_id}", dependencies=[Depends(verify_admin)])
+def delete_supervisor(sup_id: str):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM supervisors WHERE id=%s", (sup_id,))
+        conn.commit()
+    return {"ok": True}
+
+# ─── SUPERVISOR AUTH CHECK ────────────────────────────────────────────────────
+
+@app.get("/supervisor/verify")
+def verify_supervisor_endpoint(credentials: HTTPBasicCredentials = Depends(verify_supervisor)):
+    return {"ok": True, "username": credentials}
+
 # ─── OPERATOR ─────────────────────────────────────────────────────────────────
 
 @app.get("/op/{token}/info")
@@ -170,7 +247,7 @@ def operator_info(token: str):
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT * FROM sessions WHERE operator_id=%s AND date=%s ORDER BY id DESC LIMIT 1",
+                "SELECT * FROM sessions WHERE operator_id=%s AND date=%s AND active=true ORDER BY id DESC LIMIT 1",
                 (op["id"], today)
             )
             session = cur.fetchone()
@@ -192,7 +269,6 @@ def operator_info(token: str):
                         if started.tzinfo is None:
                             started = started.replace(tzinfo=timezone.utc)
                         elapsed_available += int((utcnow() - started).total_seconds())
-
                 cur.execute(
                     "SELECT COALESCE(SUM(duration_seconds),0) as total FROM status_log WHERE session_id=%s AND status='available' AND ended_at IS NOT NULL",
                     (session["id"],)
@@ -213,15 +289,16 @@ async def start_session(token: str, data: StartSession):
     now = utcnow()
     with get_db() as conn:
         with conn.cursor() as cur:
+            # Check only ACTIVE sessions
             cur.execute(
-                "SELECT * FROM sessions WHERE operator_id=%s AND date=%s",
+                "SELECT * FROM sessions WHERE operator_id=%s AND date=%s AND active=true",
                 (op["id"], today)
             )
             existing = cur.fetchone()
             if existing:
                 return {"session_id": existing["id"], "already_exists": True}
             cur.execute(
-                "INSERT INTO sessions (operator_id, date, available_minutes, started_at) VALUES (%s,%s,%s,%s) RETURNING id",
+                "INSERT INTO sessions (operator_id, date, available_minutes, started_at, active) VALUES (%s,%s,%s,%s,true) RETURNING id",
                 (op["id"], today, data.available_minutes, now)
             )
             session_id = cur.fetchone()["id"]
@@ -245,13 +322,15 @@ async def update_status(token: str, data: UpdateStatus):
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT * FROM sessions WHERE operator_id=%s AND date=%s ORDER BY id DESC LIMIT 1",
+                "SELECT * FROM sessions WHERE operator_id=%s AND date=%s AND active=true ORDER BY id DESC LIMIT 1",
                 (op["id"], today)
             )
             session = cur.fetchone()
             if not session:
                 raise HTTPException(status_code=400, detail="No active session for today")
             session = dict(session)
+
+            # Close last open log
             cur.execute(
                 "SELECT * FROM status_log WHERE session_id=%s AND ended_at IS NULL ORDER BY id DESC LIMIT 1",
                 (session["id"],)
@@ -267,16 +346,26 @@ async def update_status(token: str, data: UpdateStatus):
                     "UPDATE status_log SET ended_at=%s, duration_seconds=%s WHERE id=%s",
                     (now, duration, last["id"])
                 )
+
             cur.execute(
                 "INSERT INTO status_log (operator_id, session_id, status, started_at) VALUES (%s,%s,%s,%s)",
                 (op["id"], session["id"], data.status, now)
             )
+
+            # If going offline → close the session so next login asks for hours again
+            if data.status == "offline":
+                cur.execute(
+                    "UPDATE sessions SET active=false WHERE id=%s",
+                    (session["id"],)
+                )
+
             cur.execute(
                 "SELECT COALESCE(SUM(duration_seconds),0) as total FROM status_log WHERE session_id=%s AND status='available' AND ended_at IS NOT NULL",
                 (session["id"],)
             )
             elapsed = cur.fetchone()["total"]
         conn.commit()
+
     await manager.broadcast({
         "event": "status_change",
         "operator_id": op["id"],
@@ -294,7 +383,7 @@ async def update_available_time(token: str, minutes: int):
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE sessions SET available_minutes=%s WHERE operator_id=%s AND date=%s",
+                "UPDATE sessions SET available_minutes=%s WHERE operator_id=%s AND date=%s AND active=true",
                 (minutes, op["id"], today)
             )
         conn.commit()
@@ -304,7 +393,7 @@ async def update_available_time(token: str, minutes: int):
 
 # ─── DASHBOARD ────────────────────────────────────────────────────────────────
 
-@app.get("/dashboard/current")
+@app.get("/dashboard/current", dependencies=[Depends(verify_supervisor)])
 def dashboard_current():
     today = date.today().isoformat()
     with get_db() as conn:
@@ -314,7 +403,7 @@ def dashboard_current():
             result = []
             for op in operators:
                 cur.execute(
-                    "SELECT * FROM sessions WHERE operator_id=%s AND date=%s ORDER BY id DESC LIMIT 1",
+                    "SELECT * FROM sessions WHERE operator_id=%s AND date=%s AND active=true ORDER BY id DESC LIMIT 1",
                     (op["id"], today)
                 )
                 session = cur.fetchone()
@@ -340,15 +429,14 @@ def dashboard_current():
                         started = started.replace(tzinfo=timezone.utc)
                     elapsed += int((utcnow() - started).total_seconds())
                 result.append({
-                    **op,
-                    "status": current_status,
+                    **op, "status": current_status,
                     "available_minutes": session["available_minutes"],
                     "elapsed_available_seconds": elapsed,
                     "session": session,
                 })
     return result
 
-@app.get("/dashboard/history")
+@app.get("/dashboard/history", dependencies=[Depends(verify_supervisor)])
 def dashboard_history(days: int = 30):
     since = (date.today() - timedelta(days=days)).isoformat()
     with get_db() as conn:
